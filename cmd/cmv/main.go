@@ -26,6 +26,7 @@ import (
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/daviddao/clockmail/pkg/model"
 	"github.com/daviddao/clockmail/pkg/store"
@@ -294,6 +295,7 @@ type keyMap struct {
 	Help    key.Binding
 	Enter   key.Binding
 	Esc     key.Binding
+	Filter  key.Binding
 }
 
 var keys = keyMap{
@@ -305,6 +307,7 @@ var keys = keyMap{
 	Help:    key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
 	Enter:   key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "select agent")),
 	Esc:     key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "back")),
+	Filter:  key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filter agent")),
 }
 
 // viewKeys maps single keys to views for fast navigation.
@@ -335,6 +338,8 @@ func contextHelp(v viewID) string {
 		return "j/k: select agent | enter: drill down | d/m/l/f/t/s: views | tab: next | ?: help | q: quit"
 	case viewAgentDetail:
 		return "j/k: scroll | esc: back to dashboard | d/m/l/f/t/s: views | ?: help | q: quit"
+	case viewMessages, viewTimeline:
+		return "j/k: scroll | /: filter agent | d/m/l/f/t/s: views | tab: next | ?: help | q: quit"
 	default:
 		return "j/k: scroll | d/m/l/f/t/s: views | tab: next | ?: help | q: quit"
 	}
@@ -390,6 +395,7 @@ type uiModel struct {
 	scrollPos       int
 	selectedAgent   int
 	detailAgentID   string // agent ID for detail view
+	filterAgent     string // agent filter for Messages/Timeline ("" = all)
 	refreshInterval time.Duration
 
 	help     help.Model
@@ -430,6 +436,10 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.activeView = v
 			m.scrollPos = 0
 			m.detailAgentID = ""
+			// Clear agent filter when leaving filterable views.
+			if v != viewMessages && v != viewTimeline {
+				m.filterAgent = ""
+			}
 			return m, nil
 		}
 
@@ -466,6 +476,10 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.activeView = (m.activeView + 1) % viewCount
 			}
+			// Clear filter when leaving filterable views.
+			if m.activeView != viewMessages && m.activeView != viewTimeline {
+				m.filterAgent = ""
+			}
 			m.scrollPos = 0
 
 		case key.Matches(msg, keys.Refresh):
@@ -488,14 +502,41 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.selectedAgent++
 				}
 			} else {
-				// Bound scrollPos to a reasonable maximum based on content.
-				// The exact line count isn't known until View(), but
-				// TotalEvents is a good upper bound for event-based views.
-				// View() will further clamp if needed (adventure4-ik4).
-				maxScroll := m.snap.TotalEvents + len(m.snap.Agents) + len(m.snap.Locks) + 20
+				// Estimate max scroll generously. Each event may produce
+				// multiple lines after message body wrapping, so multiply
+				// by a factor. View() clamps if we overshoot (adventure4-ik4).
+				maxScroll := (m.snap.TotalEvents+len(m.snap.Agents)+len(m.snap.Locks))*8 + 20
 				if m.scrollPos < maxScroll {
 					m.scrollPos++
 				}
+			}
+
+		case key.Matches(msg, keys.Filter):
+			// Cycle agent filter: "" -> agent1 -> agent2 -> ... -> "".
+			// Only applies in Messages and Timeline views.
+			if m.activeView == viewMessages || m.activeView == viewTimeline {
+				agents := m.snap.Agents
+				if m.filterAgent == "" && len(agents) > 0 {
+					m.filterAgent = agents[0].ID
+				} else {
+					// Find current agent index and advance.
+					found := false
+					for i, ag := range agents {
+						if ag.ID == m.filterAgent {
+							if i+1 < len(agents) {
+								m.filterAgent = agents[i+1].ID
+							} else {
+								m.filterAgent = "" // wrap to "all"
+							}
+							found = true
+							break
+						}
+					}
+					if !found {
+						m.filterAgent = ""
+					}
+				}
+				m.scrollPos = 0
 			}
 
 		case key.Matches(msg, keys.Help):
@@ -666,6 +707,10 @@ func (m uiModel) View() string {
 		content = strings.Join(lines, "\n")
 	}
 
+	// Truncate each line to terminal width so content doesn't wrap
+	// on resize. Uses ANSI-aware width measurement.
+	content = truncateLines(content, m.width)
+
 	b.WriteString(content)
 
 	// Pad to fill screen.
@@ -816,14 +861,41 @@ func (m uiModel) renderDashboard() string {
 
 func (m uiModel) renderMessages() string {
 	var b strings.Builder
-	b.WriteString(headerStyle.Render("Messages"))
+	if m.filterAgent != "" {
+		b.WriteString(headerStyle.Render("Messages"))
+		b.WriteString(dimStyle.Render(" "))
+		b.WriteString(msgFromStyle.Render(fmt.Sprintf("[filter: %s]", m.filterAgent)))
+	} else {
+		b.WriteString(headerStyle.Render("Messages"))
+	}
 	b.WriteRune('\n')
 
 	msgs := filterEvents(m.snap.Events, model.EventMsg)
+	// Apply agent filter.
+	if m.filterAgent != "" {
+		var filtered []model.Event
+		for _, e := range msgs {
+			if eventMatchesAgent(e, m.filterAgent) {
+				filtered = append(filtered, e)
+			}
+		}
+		msgs = filtered
+	}
 	if len(msgs) == 0 {
-		b.WriteString(dimStyle.Render("  (no messages)"))
+		if m.filterAgent != "" {
+			b.WriteString(dimStyle.Render(fmt.Sprintf("  (no messages involving %s)", m.filterAgent)))
+		} else {
+			b.WriteString(dimStyle.Render("  (no messages)"))
+		}
 		b.WriteRune('\n')
 		return b.String()
+	}
+
+	// Available width for message body wrapping.
+	bodyIndent := "        " // 8 spaces
+	bodyWidth := m.width - len(bodyIndent) - 1
+	if bodyWidth < 20 {
+		bodyWidth = 20
 	}
 
 	for i := len(msgs) - 1; i >= 0; i-- {
@@ -831,7 +903,13 @@ func (m uiModel) renderMessages() string {
 		from := msgFromStyle.Render(e.AgentID)
 		to := msgToStyle.Render(e.Target)
 		ts := dimStyle.Render(fmt.Sprintf("[L:%d]", e.LamportTS))
-		b.WriteString(fmt.Sprintf("  %s %s -> %s: %s\n", ts, from, to, e.Body))
+		b.WriteString(fmt.Sprintf("  %s %s -> %s\n", ts, from, to))
+		// Wrap message body to terminal width.
+		for _, line := range wrapText(e.Body, bodyWidth) {
+			b.WriteString(bodyIndent)
+			b.WriteString(line)
+			b.WriteRune('\n')
+		}
 	}
 
 	return b.String()
@@ -988,11 +1066,33 @@ func buildCausalSet(events []model.Event) map[int64]bool {
 
 func (m uiModel) renderTimeline() string {
 	var b strings.Builder
-	b.WriteString(headerStyle.Render("Event Timeline"))
+	if m.filterAgent != "" {
+		b.WriteString(headerStyle.Render("Event Timeline"))
+		b.WriteString(dimStyle.Render(" "))
+		b.WriteString(msgFromStyle.Render(fmt.Sprintf("[filter: %s]", m.filterAgent)))
+	} else {
+		b.WriteString(headerStyle.Render("Event Timeline"))
+	}
 	b.WriteRune('\n')
 
-	if len(m.snap.Events) == 0 {
-		b.WriteString(dimStyle.Render("  (no events)"))
+	// Apply agent filter.
+	events := m.snap.Events
+	if m.filterAgent != "" {
+		var filtered []model.Event
+		for _, e := range events {
+			if eventMatchesAgent(e, m.filterAgent) {
+				filtered = append(filtered, e)
+			}
+		}
+		events = filtered
+	}
+
+	if len(events) == 0 {
+		if m.filterAgent != "" {
+			b.WriteString(dimStyle.Render(fmt.Sprintf("  (no events involving %s)", m.filterAgent)))
+		} else {
+			b.WriteString(dimStyle.Render("  (no events)"))
+		}
 		b.WriteRune('\n')
 		return b.String()
 	}
@@ -1011,8 +1111,16 @@ func (m uiModel) renderTimeline() string {
 	b.WriteRune('\n')
 
 	// Group events by Lamport timestamp.
-	groups := groupByLamport(m.snap.Events)
-	causalIDs := buildCausalSet(m.snap.Events)
+	groups := groupByLamport(events)
+	causalIDs := buildCausalSet(events)
+
+	// Body lines use a modest indent to show they belong to the message above
+	// without wasting horizontal space on deep alignment.
+	bodyIndent := "          " // 10 spaces
+	bodyWidth := m.width - len(bodyIndent) - 1
+	if bodyWidth < 20 {
+		bodyWidth = 20
+	}
 
 	// Show most recent first.
 	for gi := len(groups) - 1; gi >= 0; gi-- {
@@ -1021,7 +1129,7 @@ func (m uiModel) renderTimeline() string {
 
 		for ei, e := range g.events {
 			ts := dimStyle.Render(fmt.Sprintf("[L:%-4d]", e.LamportTS))
-			agent := msgFromStyle.Render(fmt.Sprintf("%-12s", e.AgentID))
+			agent := msgFromStyle.Render(e.AgentID)
 
 			// Concurrency marker: show bracket for multi-agent groups.
 			marker := "   "
@@ -1041,21 +1149,30 @@ func (m uiModel) renderTimeline() string {
 				causalMark = causalStyle.Render("\u2192 ") // →
 			}
 
-			var detail string
 			switch e.Kind {
 			case model.EventMsg:
-				detail = fmt.Sprintf("-> %s: %s", msgToStyle.Render(e.Target), e.Body)
+				// Header line: timestamp, markers, agent, and target.
+				b.WriteString(fmt.Sprintf("  %s%s%s%s -> %s\n",
+					ts, marker, causalMark, agent, msgToStyle.Render(e.Target)))
+				// Body wrapped below with indent.
+				for _, line := range wrapText(e.Body, bodyWidth) {
+					b.WriteString(bodyIndent)
+					b.WriteString(line)
+					b.WriteRune('\n')
+				}
 			case model.EventLockReq:
-				detail = lockStyle.Render(fmt.Sprintf("lock %s", e.Target))
+				b.WriteString(fmt.Sprintf("  %s%s%s%s %s\n",
+					ts, marker, causalMark, agent, lockStyle.Render("lock "+e.Target)))
 			case model.EventLockRel:
-				detail = dimStyle.Render(fmt.Sprintf("unlock %s", e.Target))
+				b.WriteString(fmt.Sprintf("  %s%s%s%s %s\n",
+					ts, marker, causalMark, agent, dimStyle.Render("unlock "+e.Target)))
 			case model.EventProgress:
-				detail = dimStyle.Render(fmt.Sprintf("heartbeat epoch=%d round=%d", e.Epoch, e.Round))
+				b.WriteString(fmt.Sprintf("  %s%s%s%s %s\n",
+					ts, marker, causalMark, agent, dimStyle.Render(fmt.Sprintf("heartbeat e%d/r%d", e.Epoch, e.Round))))
 			default:
-				detail = fmt.Sprintf("%s %s %s", e.Kind, e.Target, e.Body)
+				b.WriteString(fmt.Sprintf("  %s%s%s%s %s %s %s\n",
+					ts, marker, causalMark, agent, string(e.Kind), e.Target, e.Body))
 			}
-
-			b.WriteString(fmt.Sprintf("  %s%s%s%s %s\n", ts, marker, causalMark, agent, detail))
 		}
 	}
 
@@ -1244,9 +1361,8 @@ func (m uiModel) renderDiagram() string {
 	}
 	b.WriteRune('\n')
 
-	// Render rows (newest first for the view, but diagram should be time-increasing).
-	// Show most recent at top (consistent with other views).
-	for ri := len(rows) - 1; ri >= 0; ri-- {
+	// Render rows with time increasing downward (Lamport 1978, Fig 1).
+	for ri := 0; ri < len(rows); ri++ {
 		row := rows[ri]
 
 		// Timestamp label.
@@ -1570,6 +1686,15 @@ func stripAnsi(s string) string {
 
 // --- Helpers ---
 
+// eventMatchesAgent returns true if the event involves the given agent as
+// sender (AgentID) or receiver (Target). Empty filter matches everything.
+func eventMatchesAgent(e model.Event, agent string) bool {
+	if agent == "" {
+		return true
+	}
+	return e.AgentID == agent || e.Target == agent
+}
+
 func filterEvents(events []model.Event, kind model.EventKind) []model.Event {
 	var out []model.Event
 	for _, e := range events {
@@ -1578,6 +1703,72 @@ func filterEvents(events []model.Event, kind model.EventKind) []model.Event {
 		}
 	}
 	return out
+}
+
+// truncateLines truncates each line in content to at most width visible
+// characters, preserving ANSI escape codes. This prevents terminal line
+// wrapping when the window is resized narrower.
+func truncateLines(content string, width int) string {
+	if width <= 0 {
+		return content
+	}
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		if lipgloss.Width(line) > width {
+			lines[i] = ansi.Truncate(line, width, "")
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// wrapText breaks s into lines of at most width characters, splitting on word
+// boundaries where possible. If a single word exceeds width it is hard-split.
+// Embedded newlines are respected — each paragraph is wrapped independently.
+func wrapText(s string, width int) []string {
+	if width <= 0 {
+		width = 80
+	}
+
+	// Split on existing newlines first so embedded \n is respected.
+	paragraphs := strings.Split(s, "\n")
+	var lines []string
+	for _, para := range paragraphs {
+		lines = append(lines, wrapParagraph(para, width)...)
+	}
+	return lines
+}
+
+// wrapParagraph wraps a single paragraph (no embedded newlines) to width.
+func wrapParagraph(s string, width int) []string {
+	if len(s) <= width {
+		return []string{s}
+	}
+
+	var lines []string
+	for len(s) > 0 {
+		if len(s) <= width {
+			lines = append(lines, s)
+			break
+		}
+		// Try to break at a space at or before position width.
+		cut := -1
+		for i := width; i > 0; i-- {
+			if s[i] == ' ' {
+				cut = i
+				break
+			}
+		}
+		if cut <= 0 {
+			// No space found — hard-split at width.
+			cut = width
+			lines = append(lines, s[:cut])
+			s = s[cut:]
+		} else {
+			lines = append(lines, s[:cut])
+			s = s[cut+1:] // skip the space
+		}
+	}
+	return lines
 }
 
 func truncate(s string, n int) string {

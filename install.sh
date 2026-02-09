@@ -440,7 +440,7 @@ try_go_install() {
 
     print_info "Building $BIN_NAME from source..."
     build_output="$tmp_dir/$BIN_NAME"
-    if ! (cd "$src_dir" && GO111MODULE=on CGO_ENABLED=0 go build -o "$build_output" "./cmd/$BIN_NAME"); then
+    if ! (cd "$src_dir" && GOWORK=off GO111MODULE=on CGO_ENABLED=0 go build -o "$build_output" "./cmd/$BIN_NAME"); then
         print_error "Go build failed."
         exit 1
     fi

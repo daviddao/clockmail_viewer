@@ -727,7 +727,7 @@ func TestScrollPosBoundedOnDown(t *testing.T) {
 	}
 
 	// scrollPos should be bounded, not 500.
-	maxReasonable := m.snap.TotalEvents + len(m.snap.Agents) + len(m.snap.Locks) + 20
+	maxReasonable := (m.snap.TotalEvents+len(m.snap.Agents)+len(m.snap.Locks))*8 + 20
 	if m.scrollPos > maxReasonable {
 		t.Errorf("scrollPos = %d after 500 Down presses, expected <= %d", m.scrollPos, maxReasonable)
 	}
@@ -1289,6 +1289,23 @@ func TestRenderDiagramWithMessages(t *testing.T) {
 	}
 }
 
+func TestRenderDiagramTimeIncreasingDownward(t *testing.T) {
+	// Verify Lamport timestamps appear in ascending order (time increasing downward).
+	m := testModel()
+	out := m.renderDiagram()
+
+	// Test data has events at L=1, 2, 3, 4.
+	// In the rendered output, "1" should appear before "4" (top to bottom).
+	idx1 := strings.Index(out, "\n  1")
+	idx4 := strings.Index(out, "\n  4")
+	if idx1 < 0 || idx4 < 0 {
+		t.Fatalf("diagram should contain timestamp rows for 1 and 4; got:\n%s", out)
+	}
+	if idx1 >= idx4 {
+		t.Errorf("timestamp 1 (pos %d) should appear before timestamp 4 (pos %d) — time must increase downward", idx1, idx4)
+	}
+}
+
 func TestRenderDiagramProcessLines(t *testing.T) {
 	// Verify process lines (│) appear for agents with no event at a given timestamp.
 	now := time.Now()
@@ -1307,5 +1324,266 @@ func TestRenderDiagramProcessLines(t *testing.T) {
 	// Process line character: │ (U+2502)
 	if !strings.Contains(out, "\u2502") {
 		t.Error("diagram should show process lines (│) for agents with no event at a timestamp")
+	}
+}
+
+// --- wrapText tests ---
+
+func TestWrapText(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		width int
+		want  []string
+	}{
+		{"short", "hello", 80, []string{"hello"}},
+		{"exact fit", "hello", 5, []string{"hello"}},
+		{"word break", "hello world foo", 11, []string{"hello world", "foo"}},
+		{"long word", "abcdefghij", 5, []string{"abcde", "fghij"}},
+		{"multi wrap", "one two three four five", 10, []string{"one two", "three four", "five"}},
+		{"empty", "", 80, []string{""}},
+		{"newline", "line one\nline two", 80, []string{"line one", "line two"}},
+		{"newline with wrap", "hello world\nthis is a longer second line here", 20, []string{"hello world", "this is a longer", "second line here"}},
+		{"multiple newlines", "a\nb\nc", 80, []string{"a", "b", "c"}},
+		{"trailing newline", "hello\n", 80, []string{"hello", ""}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := wrapText(tt.input, tt.width)
+			if len(got) != len(tt.want) {
+				t.Fatalf("wrapText(%q, %d) = %v (len %d), want %v (len %d)",
+					tt.input, tt.width, got, len(got), tt.want, len(tt.want))
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("wrapText(%q, %d)[%d] = %q, want %q",
+						tt.input, tt.width, i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestRenderMessagesWrapsBody verifies that long message bodies are wrapped
+// onto separate lines instead of being cut off.
+func TestRenderMessagesWrapsBody(t *testing.T) {
+	now := time.Now()
+	snap := testSnapshot()
+	longBody := "This is a very long message that should be wrapped onto multiple lines rather than being cut off at the right edge of the terminal"
+	snap.Events = []model.Event{
+		{ID: 1, AgentID: "alice", LamportTS: 1, Kind: model.EventMsg, Target: "bob", Body: longBody, CreatedAt: now},
+	}
+
+	m := testModel()
+	m.snap = snap
+	m.width = 60 // narrow terminal
+	out := m.renderMessages()
+
+	// The header line should have "alice" and "bob".
+	if !strings.Contains(out, "alice") || !strings.Contains(out, "bob") {
+		t.Error("messages should contain sender and recipient")
+	}
+	// The body should be present (not truncated) — wrapping may split words
+	// across lines, so check for a phrase from the end of the body.
+	if !strings.Contains(out, "right edge of the terminal") {
+		t.Error("long message body should be fully present, not truncated")
+	}
+	// Body should span multiple lines (wrapped).
+	lines := strings.Split(out, "\n")
+	bodyLines := 0
+	for _, l := range lines {
+		if strings.HasPrefix(l, "        ") { // bodyIndent = 8 spaces
+			bodyLines++
+		}
+	}
+	if bodyLines < 2 {
+		t.Errorf("long message should wrap to at least 2 lines at width=60, got %d body lines", bodyLines)
+	}
+}
+
+// TestRenderTimelineMessageWraps verifies that message bodies in the timeline
+// view wrap properly instead of being cut off.
+func TestRenderTimelineMessageWraps(t *testing.T) {
+	now := time.Now()
+	snap := testSnapshot()
+	longBody := "Starting round 2 of improvements working on gate command and status enhancements for frontier based coordination"
+	snap.Events = []model.Event{
+		{ID: 1, AgentID: "alice", LamportTS: 1, Kind: model.EventMsg, Target: "bob", Body: longBody, CreatedAt: now},
+	}
+
+	m := testModel()
+	m.snap = snap
+	m.width = 70
+	out := m.renderTimeline()
+
+	// Full body should be present.
+	if !strings.Contains(out, "frontier based coordination") {
+		t.Error("timeline should contain the full message body, not truncate it")
+	}
+}
+
+// --- Agent filter tests ---
+
+func TestEventMatchesAgent(t *testing.T) {
+	e := model.Event{AgentID: "alice", Target: "bob", Kind: model.EventMsg}
+
+	if !eventMatchesAgent(e, "") {
+		t.Error("empty filter should match everything")
+	}
+	if !eventMatchesAgent(e, "alice") {
+		t.Error("should match sender")
+	}
+	if !eventMatchesAgent(e, "bob") {
+		t.Error("should match receiver")
+	}
+	if eventMatchesAgent(e, "charlie") {
+		t.Error("should not match unrelated agent")
+	}
+}
+
+func TestFilterCyclesAgents(t *testing.T) {
+	m := testModel()
+	m.activeView = viewMessages
+
+	// Initially no filter.
+	if m.filterAgent != "" {
+		t.Fatal("filter should start empty")
+	}
+
+	// Press / — should cycle to first agent (alice).
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	m = updated.(uiModel)
+	if m.filterAgent != "alice" {
+		t.Errorf("first / should set filter to alice, got %q", m.filterAgent)
+	}
+
+	// Press / again — should cycle to bob.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	m = updated.(uiModel)
+	if m.filterAgent != "bob" {
+		t.Errorf("second / should set filter to bob, got %q", m.filterAgent)
+	}
+
+	// Press / again — should wrap back to "" (all).
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	m = updated.(uiModel)
+	if m.filterAgent != "" {
+		t.Errorf("third / should clear filter, got %q", m.filterAgent)
+	}
+}
+
+func TestFilterOnlyInMessagesAndTimeline(t *testing.T) {
+	m := testModel()
+	m.activeView = viewDashboard
+
+	// / should not set a filter on dashboard.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	m = updated.(uiModel)
+	if m.filterAgent != "" {
+		t.Error("/ should not set filter on dashboard view")
+	}
+}
+
+func TestFilterClearedOnViewSwitch(t *testing.T) {
+	m := testModel()
+	m.activeView = viewMessages
+	m.filterAgent = "alice"
+
+	// Switch to dashboard via shortcut — filter should be cleared.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+	m = updated.(uiModel)
+	if m.filterAgent != "" {
+		t.Errorf("filter should be cleared on switch to dashboard, got %q", m.filterAgent)
+	}
+}
+
+func TestFilterPersistsBetweenMessagesAndTimeline(t *testing.T) {
+	m := testModel()
+	m.activeView = viewMessages
+	m.filterAgent = "alice"
+
+	// Switch to timeline — filter should persist.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
+	m = updated.(uiModel)
+	if m.filterAgent != "alice" {
+		t.Errorf("filter should persist when switching to timeline, got %q", m.filterAgent)
+	}
+
+	// Switch back to messages — still persists.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("m")})
+	m = updated.(uiModel)
+	if m.filterAgent != "alice" {
+		t.Errorf("filter should persist when switching to messages, got %q", m.filterAgent)
+	}
+}
+
+func TestRenderMessagesFiltered(t *testing.T) {
+	m := testModel()
+	m.filterAgent = "alice"
+	out := m.renderMessages()
+
+	// Should show filter indicator.
+	if !strings.Contains(out, "filter: alice") {
+		t.Error("filtered messages should show filter indicator")
+	}
+	// Should contain alice's message.
+	if !strings.Contains(out, "hello") {
+		t.Error("filtered messages should include alice's sent message")
+	}
+	// alice->bob message and bob->alice reply both involve alice, so both should appear.
+	if !strings.Contains(out, "hi back") {
+		t.Error("filtered messages should include message sent to alice")
+	}
+}
+
+func TestRenderMessagesFilteredNoMatch(t *testing.T) {
+	m := testModel()
+	m.filterAgent = "charlie"
+	out := m.renderMessages()
+
+	if !strings.Contains(out, "no messages involving charlie") {
+		t.Error("should show no-match message for unknown agent filter")
+	}
+}
+
+func TestRenderTimelineFiltered(t *testing.T) {
+	m := testModel()
+	m.filterAgent = "bob"
+	out := m.renderTimeline()
+
+	// Should show filter indicator.
+	if !strings.Contains(out, "filter: bob") {
+		t.Error("filtered timeline should show filter indicator")
+	}
+	// bob's events should appear.
+	if !strings.Contains(out, "bob") {
+		t.Error("filtered timeline should contain bob's events")
+	}
+}
+
+func TestRenderTimelineFilteredEmpty(t *testing.T) {
+	m := testModel()
+	m.filterAgent = "charlie"
+	out := m.renderTimeline()
+
+	if !strings.Contains(out, "no events involving charlie") {
+		t.Error("should show no-match message for unknown agent filter")
+	}
+}
+
+func TestContextHelpShowsFilter(t *testing.T) {
+	got := contextHelp(viewMessages)
+	if !strings.Contains(got, "/") {
+		t.Error("messages context help should mention / for filter")
+	}
+	got = contextHelp(viewTimeline)
+	if !strings.Contains(got, "/") {
+		t.Error("timeline context help should mention / for filter")
+	}
+	// Other views should not mention filter.
+	got = contextHelp(viewDashboard)
+	if strings.Contains(got, "filter") {
+		t.Error("dashboard context help should not mention filter")
 	}
 }
