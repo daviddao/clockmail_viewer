@@ -1,3 +1,5 @@
 /cmv
 .clockmail/
 dist/
+go.work
+go.work.sum
