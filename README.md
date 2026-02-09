@@ -1,6 +1,6 @@
 # Clockmail Viewer (cmv)
 
-<img width="760" alt="Logical Clocks" src="https://github.com/user-attachments/assets/4294504d-e802-4b11-98f8-d0c6446dc006" />
+<img width="595" height="464" alt="Lamport Figure" src="https://github.com/user-attachments/assets/3429ee1c-c8e1-4fdd-bd33-7c5c85a5e6af" />
 
 > **Real-time TUI for monitoring multi-agent [clockmail](https://github.com/daviddao/clockmail) coordination.**
 
