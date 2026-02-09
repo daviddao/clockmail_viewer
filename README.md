@@ -1,6 +1,8 @@
 # Clockmail Viewer (cmv)
 
-> **Real-time TUI for monitoring multi-agent [clockmail](../clockmail/) coordination.**
+<img width="760" alt="Logical Clocks" src="https://github.com/user-attachments/assets/4294504d-e802-4b11-98f8-d0c6446dc006" />
+
+> **Real-time TUI for monitoring multi-agent [clockmail](https://github.com/daviddao/clockmail) coordination.**
 
 A Bubble Tea terminal interface that watches the clockmail SQLite database and displays agents, Lamport clocks, locks, messages, and Naiad frontier status — all updating live as agents work.
 
